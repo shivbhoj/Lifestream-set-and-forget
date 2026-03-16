@@ -1,0 +1,607 @@
+Lifestream — Firebase Architecture & Prototype Plan
+TL;DR: Lifestream is a lifecycle reminder app (think: “remind me to renew my passport, rotate tires, replace HVAC filter”). This plan maps the full spec onto Firebase-native services, with a realistic phased build approach.
+
+1. Core App Concept & User Flows
+What Lifestream Does
+Manages time-sensitive life events (documents, appliances, health, subscriptions) with smart reminders, auto-detection, and escalating nudges — all automated after initial setup.
+User Journey (Firebase Auth → First Reminder)
+
+[Splash Screen]
+      ↓
+[Sign In / Sign Up] ← Firebase Auth (Google, Apple, Email)
+      ↓
+[Onboarding Wizard] ← 3 steps max
+  Step 1: Pick life categories (Health, Home, Legal, Auto, Finance)
+  Step 2: Add first item via natural language ("My passport expires June 2027")
+  Step 3: Set notification preferences (push, email, cadence)
+      ↓
+[Dashboard] ← Firestore real-time listener
+  - Upcoming items (next 30 days)
+  - Overdue items (red banner)
+  - Completed/snoozed
+      ↓
+[Item Detail View]
+  - Edit, snooze, complete, share
+  - Audit trail (who touched this, when)
+
+
+Firebase Auth Configuration
+
+// firebase.config.ts
+const authProviders = [
+  new GoogleAuthProvider(),
+  new OAuthProvider('apple.com'),
+  EmailAuthProvider
+];
+
+// Enable persistent auth state
+setPersistence(auth, browserLocalPersistence);
+
+
+2. Database & Data Models
+Architecture Decision
+	∙	Firestore → Primary user data, reminders, settings (real-time sync, offline support)
+	∙	Cloud SQL (PostgreSQL) → Audit logs, analytics, reporting (relational queries)
+	∙	Redis (Memorystore) → Notification queue, rate limiting, scheduler state
+
+Firestore Collection Structure
+
+/users/{userId}
+/users/{userId}/reminders/{reminderId}
+/users/{userId}/vaults/{vaultId}          ← shared/collaborative
+/users/{userId}/settings/preferences
+/auditLogs/{logId}                        ← top-level for admin queries
+
+
+Data Models (TypeScript Interfaces)
+User Document /users/{userId}
+
+interface User {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL?: string;
+  createdAt: Timestamp;
+  lastActiveAt: Timestamp;
+  settings: {
+    defaultNotificationChannels: ('push' | 'email' | 'sms')[];
+    timezone: string;                    // e.g., "America/New_York"
+    quietHoursStart: string;            // "22:00"
+    quietHoursEnd: string;              // "08:00"
+    escalationEnabled: boolean;
+  };
+  subscription: 'free' | 'pro';
+  fcmTokens: string[];                  // array for multi-device
+}
+
+
+Reminder Document /users/{userId}/reminders/{reminderId}
+
+interface Reminder {
+  id: string;
+  userId: string;
+  title: string;                        // "Renew Passport"
+  description?: string;
+  category: ReminderCategory;           // enum below
+  status: 'active' | 'snoozed' | 'completed' | 'expired';
+  
+  // Lifecycle dates
+  createdAt: Timestamp;
+  itemStartDate?: Timestamp;            // when did the thing begin? (e.g., lease start)
+  expirationDate: Timestamp;            // the actual deadline
+  completedAt?: Timestamp;
+  
+  // Notification config
+  reminderIntervals: number[];          // days before expiry: [90, 30, 14, 7, 3, 1]
+  escalationEnabled: boolean;
+  nextNotificationAt: Timestamp;
+  lastNotifiedAt?: Timestamp;
+  notificationCount: number;
+  
+  // Smart deferral
+  snoozeUntil?: Timestamp;
+  snoozeCount: number;
+  maxSnoozes: number;                   // after this, escalate
+  
+  // NLP source
+  rawInput?: string;                    // "my car registration expires next March"
+  parsedByAI: boolean;
+  
+  // Sharing
+  sharedWith?: string[];               // userIds
+  vaultId?: string;
+  
+  // Metadata
+  tags: string[];
+  attachments?: { name: string; url: string; storagePath: string }[];
+  updatedAt: Timestamp;
+}
+
+type ReminderCategory = 
+  | 'identity'       // passport, license, ID
+  | 'vehicle'        // registration, insurance, inspection
+  | 'health'         // prescriptions, checkups, vaccinations
+  | 'home'           // lease, appliances, HVAC, warranties
+  | 'finance'        // subscriptions, taxes, credit cards
+  | 'legal'          // contracts, wills
+  | 'custom';
+
+
+Audit Log /auditLogs/{logId} (also mirrored to Cloud SQL)
+
+interface AuditLog {
+  id: string;
+  userId: string;
+  reminderId: string;
+  action: 'created' | 'updated' | 'deleted' | 'snoozed' | 'completed' | 'shared' | 'notified';
+  changedFields?: Record<string, { before: any; after: any }>;
+  actorId: string;                     // userId or 'system'
+  ipAddress?: string;
+  userAgent?: string;
+  timestamp: Timestamp;
+}
+
+
+Firestore Security Rules
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Users can only read/write their own data
+    match /users/{userId} {
+      allow read, write: if request.auth.uid == userId;
+      
+      match /reminders/{reminderId} {
+        allow read, write: if request.auth.uid == userId
+          || request.auth.uid in resource.data.sharedWith;
+        
+        // Prevent status manipulation via client on completed items
+        allow update: if resource.data.status != 'completed'
+          || request.auth.uid == userId;
+      }
+    }
+    
+    // Audit logs: write only (system writes, user can read their own)
+    match /auditLogs/{logId} {
+      allow read: if request.auth.uid == resource.data.userId;
+      allow write: if false; // Cloud Functions only
+    }
+  }
+}
+
+
+3. Backend Services & Architecture
+Service Map
+
+┌─────────────────────────────────────────────────────┐
+│                  CLIENT (React Native)               │
+│         Firestore SDK + FCM + Auth SDK               │
+└──────────────────────┬──────────────────────────────┘
+                       │ HTTPS / Firestore Triggers
+          ┌────────────┴────────────┐
+          │                         │
+   ┌──────▼──────┐         ┌────────▼────────┐
+   │  Cloud      │         │   Cloud Run     │
+   │  Functions  │         │   (NestJS API)  │
+   │  (triggers) │         │   /api/v1       │
+   └──────┬──────┘         └────────┬────────┘
+          │                         │
+   ┌──────▼─────────────────────────▼────────┐
+   │           Firebase Services              │
+   │  Firestore │ FCM │ Storage │ Auth        │
+   └──────┬─────────────────────────┬─────────┘
+          │                         │
+   ┌──────▼──────┐         ┌────────▼────────┐
+   │  Cloud SQL  │         │  Memorystore    │
+   │ (PostgreSQL)│         │    (Redis)      │
+   │ Audit Logs  │         │  Notif Queue    │
+   └─────────────┘         └─────────────────┘
+
+
+Cloud Functions (Event-Driven Triggers)
+
+// functions/src/index.ts
+
+// 1. NLP Parser — triggers when new reminder is created with rawInput
+export const parseReminderInput = onDocumentCreated(
+  'users/{userId}/reminders/{reminderId}',
+  async (event) => {
+    const data = event.data?.data();
+    if (!data?.rawInput || data.parsedByAI) return;
+    
+    // Call Vertex AI (Gemini) to extract dates and context
+    const parsed = await parseWithVertexAI(data.rawInput);
+    
+    await event.data?.ref.update({
+      expirationDate: Timestamp.fromDate(parsed.date),
+      category: parsed.category,
+      reminderIntervals: generateIntervals(parsed.urgencyLevel),
+      parsedByAI: true,
+      nextNotificationAt: calculateNextNotification(parsed.date, parsed.intervals)
+    });
+  }
+);
+
+// 2. Notification Scheduler — runs every hour via Cloud Scheduler
+export const scheduleNotifications = onSchedule('every 60 minutes', async () => {
+  const now = Timestamp.now();
+  const cutoff = Timestamp.fromMillis(now.toMillis() + 3600000); // +1 hour
+  
+  const dueReminders = await db
+    .collectionGroup('reminders')
+    .where('status', '==', 'active')
+    .where('nextNotificationAt', '<=', cutoff)
+    .get();
+  
+  // Push to Redis queue for ordered dispatch
+  const pipeline = redis.pipeline();
+  dueReminders.docs.forEach(doc => {
+    pipeline.zadd('notification_queue', doc.data().nextNotificationAt.toMillis(), doc.id);
+  });
+  await pipeline.exec();
+});
+
+// 3. Audit Logger — triggers on any reminder write
+export const logReminderChange = onDocumentWritten(
+  'users/{userId}/reminders/{reminderId}',
+  async (event) => {
+    const before = event.data?.before?.data();
+    const after = event.data?.after?.data();
+    
+    const changedFields = diffObjects(before, after);
+    
+    await db.collection('auditLogs').add({
+      userId: event.params.userId,
+      reminderId: event.params.reminderId,
+      action: determineAction(before, after),
+      changedFields,
+      actorId: after?.lastModifiedBy || 'system',
+      timestamp: Timestamp.now()
+    });
+  }
+);
+
+
+Cloud Run — NestJS API (Microservice Layer)
+
+// src/notifications/notification.service.ts (NestJS)
+
+@Injectable()
+export class NotificationService {
+  constructor(
+    private readonly fcm: FirebaseMessagingService,
+    private readonly redis: RedisService,
+    private readonly firestore: FirestoreService
+  ) {}
+
+  async dispatchNotification(reminderId: string): Promise<void> {
+    const reminder = await this.firestore.getReminder(reminderId);
+    const user = await this.firestore.getUser(reminder.userId);
+    
+    // Check quiet hours
+    if (this.isQuietHours(user.settings)) {
+      await this.deferToEndOfQuietHours(reminderId, user.settings);
+      return;
+    }
+    
+    // Build escalating message based on snooze count
+    const message = this.buildEscalatingMessage(reminder);
+    
+    // Send to all user devices
+    const results = await this.fcm.sendMulticast({
+      tokens: user.fcmTokens,
+      notification: {
+        title: message.title,
+        body: message.body,
+      },
+      data: {
+        reminderId: reminder.id,
+        action: 'open_reminder',
+        urgencyLevel: message.urgencyLevel,
+        daysUntilExpiry: String(message.daysUntilExpiry)
+      },
+      apns: {
+        payload: {
+          aps: {
+            'interruption-level': message.urgencyLevel === 'critical' ? 'time-sensitive' : 'active',
+            sound: 'default'
+          }
+        }
+      },
+      android: {
+        priority: message.urgencyLevel === 'critical' ? 'high' : 'normal',
+        notification: { channelId: `lifestream_${message.urgencyLevel}` }
+      }
+    });
+    
+    // Update Firestore with next scheduled notification
+    await this.firestore.updateReminderAfterNotification(reminder, results);
+  }
+
+  private buildEscalatingMessage(reminder: Reminder): NotificationMessage {
+    const days = daysBetween(new Date(), reminder.expirationDate.toDate());
+    
+    if (days <= 1) return {
+      title: '🚨 URGENT: Expires Tomorrow!',
+      body: `${reminder.title} expires in less than 24 hours. Act now.`,
+      urgencyLevel: 'critical'
+    };
+    if (days <= 7) return {
+      title: `⚠️ ${reminder.title} — ${days} days left`,
+      body: 'This is getting urgent. Tap to review.',
+      urgencyLevel: 'high'
+    };
+    return {
+      title: `📅 Reminder: ${reminder.title}`,
+      body: `Expires in ${days} days.`,
+      urgencyLevel: 'normal'
+    };
+  }
+}
+
+
+4. Notification Strategy
+FCM Channel Setup (Android)
+
+// Mobile: notification channels registered on app init
+const channels = [
+  { id: 'lifestream_critical', name: 'Urgent Reminders', importance: 5, sound: 'alarm' },
+  { id: 'lifestream_high',     name: 'Upcoming Deadlines', importance: 4 },
+  { id: 'lifestream_normal',   name: 'General Reminders', importance: 3 },
+];
+
+
+Dynamic Interval Engine
+
+function generateIntervals(category: ReminderCategory, daysUntilExpiry: number): number[] {
+  const baseIntervals: Record<ReminderCategory, number[]> = {
+    identity:  [180, 90, 60, 30, 14, 7, 3, 1],
+    vehicle:   [60, 30, 14, 7, 3, 1],
+    health:    [30, 14, 7, 3, 1],
+    finance:   [30, 14, 7, 1],
+    home:      [90, 30, 7, 1],
+    legal:     [90, 30, 14, 7, 1],
+    custom:    [30, 7, 1],
+  };
+  
+  // Only return intervals that are still in the future
+  return baseIntervals[category].filter(d => d <= daysUntilExpiry);
+}
+
+
+Smart Deferral Logic
+
+User snoozes → snoozeCount++
+  if snoozeCount >= maxSnoozes:
+    → escalate urgencyLevel
+    → notify shared vault members (if any)
+    → send email fallback (via Firebase Email Extension)
+  else:
+    → schedule next nudge in 24h OR end of quiet hours
+
+
+5. Offline Capabilities & Data Sync
+Architecture
+
+[WatermelonDB — SQLite on device]
+        ↕ sync adapter
+[Firestore offline persistence]
+        ↕ real-time listener
+[Cloud Firestore]
+
+
+Implementation
+
+// database/sync.ts — WatermelonDB ↔ Firestore bridge
+
+export class LifestreamSyncAdapter {
+  async synchronize() {
+    await synchronize({
+      database,
+      pullChanges: async ({ lastPulledAt }) => {
+        const snapshot = await db
+          .collection(`users/${userId}/reminders`)
+          .where('updatedAt', '>', Timestamp.fromMillis(lastPulledAt ?? 0))
+          .get();
+        
+        return {
+          changes: formatForWatermelonDB(snapshot.docs),
+          timestamp: Date.now()
+        };
+      },
+      pushChanges: async ({ changes }) => {
+        const batch = db.batch();
+        changes.reminders.created.forEach(r => {
+          batch.set(db.doc(`users/${userId}/reminders/${r.id}`), toFirestore(r));
+        });
+        changes.reminders.updated.forEach(r => {
+          batch.update(db.doc(`users/${userId}/reminders/${r.id}`), toFirestore(r));
+        });
+        await batch.commit();
+      }
+    });
+  }
+}
+
+
+Firestore Offline Config
+
+// Enable offline persistence on app init
+initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager()
+  })
+});
+
+
+6. Enhancement Suggestions
+A — Vertex AI (Gemini) for NLP + Predictions
+
+// Cloud Function: parse natural language input
+async function parseWithVertexAI(rawInput: string): Promise<ParsedReminder> {
+  const model = vertex.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  
+  const prompt = `
+    Extract structured data from this reminder input.
+    Return ONLY valid JSON with: { date, category, urgencyLevel, title }
+    
+    Input: "${rawInput}"
+    Today's date: ${new Date().toISOString()}
+  `;
+  
+  const result = await model.generateContent(prompt);
+  return JSON.parse(result.response.text());
+}
+
+// Prediction: flag items likely to be forgotten
+async function predictAtRiskItems(userId: string): Promise<string[]> {
+  // Query user's historical snooze/miss patterns
+  const history = await getAuditHistory(userId);
+  
+  // Use Vertex AI to identify patterns
+  // e.g., "User always ignores vehicle reminders" → increase urgency
+}
+
+
+B — Firebase Realtime Database for IoT Sync
+
+// IoT device (e.g., smart appliance) writes to RTDB
+// Cloud Function listens and syncs to Firestore
+
+export const syncIoTData = onValueCreated(
+  '/iot/{deviceId}/events/{eventId}',
+  async (event) => {
+    const { userId, applianceType, eventType, timestamp } = event.data.val();
+    
+    // e.g., HVAC filter alert from smart thermostat
+    if (eventType === 'maintenance_needed') {
+      await createOrUpdateReminder(userId, {
+        title: `${applianceType} Maintenance Required`,
+        category: 'home',
+        expirationDate: addDays(timestamp, 7),
+        rawInput: `IoT trigger: ${applianceType} ${eventType}`,
+        parsedByAI: false
+      });
+    }
+  }
+);
+
+
+C — Collaborative Vaults (Shared Reminders)
+
+// Vault = shared reminder group (household, family, business)
+interface Vault {
+  id: string;
+  name: string;                       // "Smith Household"
+  ownerId: string;
+  members: { userId: string; role: 'owner' | 'editor' | 'viewer' }[];
+  reminderIds: string[];
+  createdAt: Timestamp;
+}
+
+// Firestore rule for vaults
+match /vaults/{vaultId} {
+  allow read: if request.auth.uid in resource.data.memberIds;
+  allow write: if resource.data.members
+    .filter(m => m.userId == request.auth.uid && m.role == 'owner').size() > 0;
+}
+
+
+7. Development & Operations
+CI/CD — GitHub Actions
+
+# .github/workflows/firebase-deploy.yml
+name: Deploy Lifestream
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run test          # Jest unit tests
+      - run: npm run test:e2e      # Detox integration tests (on emulator)
+
+  deploy-functions:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - run: npm run build -w functions
+      - run: npx firebase deploy --only functions
+
+  deploy-app:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx firebase appdistribution:distribute app-release.apk
+          --app ${{ secrets.FIREBASE_APP_ID }}
+          --groups "alpha-testers"
+
+
+Security — AES-256 Encryption for Sensitive Fields
+
+// Applied to attachment URLs, description fields in Firestore
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+
+const ALGORITHM = 'aes-256-gcm';
+
+export function encryptField(text: string, key: Buffer): EncryptedPayload {
+  const iv = randomBytes(16);
+  const cipher = createCipheriv(ALGORITHM, key, iv);
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return {
+    encrypted: encrypted.toString('hex'),
+    iv: iv.toString('hex'),
+    authTag: authTag.toString('hex')
+  };
+}
+// Key stored in Google Secret Manager, never in client code
+
+
+8. Launch Roadmap
+Phase 1 — Alpha (Weeks 1–6) [Firebase Studio Prototype]
+	∙	Firebase Auth (Google + Apple)
+	∙	Firestore schema + security rules
+	∙	Add reminder manually (no NLP yet)
+	∙	FCM push notifications (basic)
+	∙	Offline read via Firestore persistence
+	∙	Firebase App Distribution → 10 alpha testers
+Phase 2 — Beta (Weeks 7–12)
+	∙	Vertex AI NLP parser (natural language input)
+	∙	Dynamic intervals + escalating notifications
+	∙	Smart deferral (snooze logic)
+	∙	Audit trail (Cloud SQL)
+	∙	Collaborative vaults
+	∙	WatermelonDB full sync adapter
+	∙	GitHub Actions CI/CD
+Phase 3 — Launch (Weeks 13–20)
+	∙	Vertex AI predictions (at-risk items)
+	∙	IoT hooks (Realtime Database)
+	∙	ASO — App Store + Play Store optimization
+	∙	Onboarding retention loop (Day 1, Day 3, Day 7 push triggers)
+	∙	In-app purchase (Pro tier via RevenueCat)
+
+Firebase Studio Prototype Quick-Start Checklist
+
+□ Create Firebase project → enable Auth, Firestore, FCM, Storage, Functions
+□ Enable Blaze plan (required for Cloud Functions + external calls)
+□ Set up Firestore in production mode with security rules above
+□ Initialize React Native with @react-native-firebase/* packages
+□ Deploy first Cloud Function: parseReminderInput
+□ Set up Cloud Scheduler for hourly notification job
+□ Connect Firebase App Distribution for internal testing
+□ Enable Vertex AI in GCP console (same project)
+□ Add Memorystore (Redis) instance via GCP console
+
+
+Bottom Line: Firebase handles ~80% of Lifestream’s infrastructure natively. The only external dependencies worth adding are Memorystore (Redis for queue ordering) and Cloud SQL (PostgreSQL for relational audit logs). Everything else — auth, real-time sync, offline, push, file storage, serverless logic — lives entirely within the Firebase/GCP ecosystem. Firebase Studio is an ideal environment to prototype Phases 1 and 2 before any app store submission.​​​​​​​​​​​​​​​​
