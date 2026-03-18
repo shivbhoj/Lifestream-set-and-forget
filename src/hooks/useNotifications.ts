@@ -28,7 +28,7 @@ export function useNotifications(): UseNotificationsReturn {
   useEffect(() => {
     if (Platform.OS !== 'android') return;
 
-    const channels: Notifications.AndroidChannel[] = [
+    const channels: Array<Notifications.NotificationChannelInput & { id: string }> = [
       {
         name: 'Urgent Reminders',
         importance: Notifications.AndroidImportance.MAX,
