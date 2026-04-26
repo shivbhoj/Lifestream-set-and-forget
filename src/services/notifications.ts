@@ -46,7 +46,7 @@ export async function cancelReminderNotifications(reminderId: string): Promise<v
 // ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
-function buildCopy(
+export function buildCopy(
   title: string,
   days: number
 ): { notifTitle: string; body: string } {
