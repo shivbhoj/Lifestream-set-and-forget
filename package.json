@@ -8,31 +8,70 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "eslint .",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "setupFiles": [],
+    "setupFilesAfterEnv": [
+      "<rootDir>/jest.setup.js"
+    ],
+    "testMatch": [
+      "**/__tests__/**/*.test.ts",
+      "**/__tests__/**/*.test.tsx"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.{ts,tsx}",
+      "!src/lib/**",
+      "!src/types/**"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 80,
+        "functions": 80,
+        "lines": 80
+      }
+    },
+    "moduleNameMapper": {
+      "^@/(.*)$": "<rootDir>/src/$1",
+      "^react-native/Libraries/BatchedBridge/NativeModules$": "<rootDir>/__mocks__/NativeModules.js"
+    },
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@unimodules/.*|unimodules|sentry-expo|native-base|react-native-svg|@supabase/.*))"
+    ]
   },
   "dependencies": {
+    "@react-native-async-storage/async-storage": "1.23.1",
+    "@react-native-community/datetimepicker": "7.6.3",
+    "@supabase/supabase-js": "^2.39.0",
     "expo": "~51.0.0",
-    "expo-router": "~3.5.0",
-    "expo-status-bar": "~1.12.0",
     "expo-constants": "~16.0.0",
     "expo-linking": "~6.3.0",
     "expo-notifications": "~0.28.0",
+    "expo-router": "~3.5.0",
     "expo-secure-store": "~13.0.0",
+    "expo-status-bar": "~1.12.0",
     "react": "18.2.0",
     "react-native": "0.74.5",
-    "react-native-safe-area-context": "4.10.5",
-    "react-native-screens": "3.31.1",
     "react-native-gesture-handler": "~2.16.1",
     "react-native-reanimated": "~3.10.1",
-    "react-native-url-polyfill": "^2.0.0",
-    "@react-native-async-storage/async-storage": "1.23.1",
-    "@react-native-community/datetimepicker": "7.6.3",
-    "@supabase/supabase-js": "^2.39.0"
+    "react-native-safe-area-context": "4.10.5",
+    "react-native-screens": "3.31.1",
+    "react-native-url-polyfill": "^2.0.0"
   },
   "devDependencies": {
     "@babel/core": "^7.24.0",
+    "@testing-library/react-hooks": "^8.0.1",
+    "@testing-library/react-native": "^13.3.3",
+    "@types/jest": "^29.5.14",
     "@types/react": "~18.2.45",
     "@types/react-native": "~0.73.0",
+    "jest": "^29.7.0",
+    "jest-expo": "^51.0.4",
+    "ts-jest": "^29.4.9",
     "typescript": "^5.3.0"
   }
 }

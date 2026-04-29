@@ -113,7 +113,7 @@ export function useReminders(userId: string | null): UseRemindersReturn {
   return { reminders, sections, loading, error, refetch: fetchReminders };
 }
 
-function buildSections(reminders: Reminder[]): ReminderSection[] {
+export function buildSections(reminders: Reminder[]): ReminderSection[] {
   const overdue: Reminder[] = [];
   const upcoming: Reminder[] = [];
   const later: Reminder[] = [];
